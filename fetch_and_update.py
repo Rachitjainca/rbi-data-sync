@@ -7,14 +7,15 @@ import os
 import json
 import logging
 import time
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, date
+from typing import Dict, List, Optional, Tuple
 import requests
 import pandas as pd
 import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import WorksheetNotFound, APIError
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -224,6 +225,91 @@ class RBIDataFetcher:
             return df.columns[0]
         
         return None
+    
+    @staticmethod
+    def _extract_month_year(sheet_name: str) -> Optional[Tuple[int, int]]:
+        """
+        Extract month and year from sheet name
+        Handles formats like: "Jan-2020", "January 2020", "2020-01", "01/2020"
+        
+        Args:
+            sheet_name: Sheet name to parse
+            
+        Returns:
+            Tuple of (year, month) or None if cannot parse
+        """
+        try:
+            sheet_lower = sheet_name.lower()
+            
+            # List of month names
+            months = {
+                'jan': 1, 'january': 1,
+                'feb': 2, 'february': 2,
+                'mar': 3, 'march': 3,
+                'apr': 4, 'april': 4,
+                'may': 5,
+                'jun': 6, 'june': 6,
+                'jul': 7, 'july': 7,
+                'aug': 8, 'august': 8,
+                'sep': 9, 'september': 9,
+                'oct': 10, 'october': 10,
+                'nov': 11, 'november': 11,
+                'dec': 12, 'december': 12
+            }
+            
+            # Try to find month name
+            month = None
+            for month_name, month_num in months.items():
+                if month_name in sheet_lower:
+                    month = month_num
+                    break
+            
+            if month is None:
+                return None
+            
+            # Try to find year (4 digits)
+            year_match = re.search(r'(19\d{2}|20\d{2})', sheet_name)
+            if not year_match:
+                return None
+            
+            year = int(year_match.group(1))
+            return (year, month)
+        except Exception:
+            return None
+    
+    @staticmethod
+    def _should_process_sheet(sheet_name: str) -> bool:
+        """
+        Check if sheet should be processed (current month or future only)
+        Skip past months to avoid reprocessing
+        
+        Args:
+            sheet_name: Sheet name to check
+            
+        Returns:
+            True if should process, False if past month (skip)
+        """
+        month_year = RBIDataFetcher._extract_month_year(sheet_name)
+        if not month_year:
+            # If cannot determine month, process it (be safe)
+            return True
+        
+        year, month = month_year
+        today = date.today()
+        current_year = today.year
+        current_month = today.month
+        
+        # Skip if month is in the past
+        if year < current_year:
+            logger.debug(f"Skipping past year sheet: {sheet_name} ({year})")
+            return False
+        
+        if year == current_year and month < current_month:
+            logger.debug(f"Skipping past month sheet: {sheet_name} ({month}/{year})")
+            return False
+        
+        # Process current month and future months
+        return True
     
     def update_gsheet_data(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> bool:
         """
@@ -442,6 +528,7 @@ class RBIDataFetcher:
     def sync_data(self) -> bool:
         """
         Main sync function: download, parse, and update Google Sheet
+        Only processes current and future month sheets; skips past months
         
         Returns:
             True if successful, False otherwise
@@ -461,11 +548,23 @@ class RBIDataFetcher:
             if not sheets_data:
                 return False
             
-            # Step 3: Update Google Sheet with new worksheets and data
-            success_count = 0
-            total_sheets = len(sheets_data)
+            # Step 3: Filter to only current and future months (skip completed past months)
+            filtered_sheets = {}
+            skipped_count = 0
+            for sheet_name, df in sheets_data.items():
+                if self._should_process_sheet(sheet_name):
+                    filtered_sheets[sheet_name] = df
+                else:
+                    skipped_count += 1
+                    logger.info(f"⊘ Skipping past month sheet: '{sheet_name}'")
             
-            for idx, (sheet_name, df) in enumerate(sheets_data.items(), 1):
+            logger.info(f"Processing {len(filtered_sheets)} sheets (skipped {skipped_count} past months)")
+            
+            # Step 4: Update Google Sheet with new worksheets and data
+            success_count = 0
+            total_sheets = len(filtered_sheets)
+            
+            for idx, (sheet_name, df) in enumerate(filtered_sheets.items(), 1):
                 logger.info(f"Processing sheet {idx}/{total_sheets}: '{sheet_name}'")
                 
                 # Sanitize sheet name for Google Sheets (max 100 chars, no special chars)
