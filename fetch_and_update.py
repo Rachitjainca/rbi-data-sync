@@ -429,7 +429,7 @@ class RBIDataFetcher:
                 logger.info(f"✓ Rebuilt worksheet '{worksheet.title}' with new schema")
                 return True
             
-            logger.info(f"Column structure matches; proceeding with incremental update")
+            logger.info(f"Column structure matches; proceeding with OVERWRITE update")
             
             # CRITICAL: Reorder DataFrame columns to match worksheet column order
             # This ensures row-hash comparison works even if columns are in different order
@@ -444,19 +444,17 @@ class RBIDataFetcher:
                 df_reordered = df.copy()
                 logger.info(f"Proceeding with original column order")
             
-            # Incremental update: only add rows not already in the worksheet
-            new_rows_df = self._filter_new_rows(df_reordered, existing_rows, header, date_col)
+            # Clear the entire worksheet and write fresh data (OVERWRITE mode)
+            logger.info(f"Clearing existing data for worksheet '{worksheet.title}' to replace with updated month data")
+            def clear_ws():
+                worksheet.clear()
+            retry_with_backoff(clear_ws)
+            logger.info(f"✓ Cleared worksheet '{worksheet.title}'")
             
-            if new_rows_df.empty:
-                logger.info(f"No new rows found for worksheet '{worksheet.title}'; skipping update")
-                return True
+            # Write all data from scratch
+            self._write_to_worksheet_incremental(worksheet, df_reordered)
             
-            logger.info(f"Found {len(new_rows_df)} new rows to append for worksheet '{worksheet.title}'")
-            
-            # Append only new rows (don't touch existing data)
-            self._append_new_rows(worksheet, new_rows_df)
-            
-            logger.info(f"✓ Successfully added {len(new_rows_df)} new rows to worksheet '{worksheet.title}'")
+            logger.info(f"✓ Successfully replaced data in worksheet '{worksheet.title}' with {len(df_reordered)} rows")
             return True
         except Exception as e:
             logger.error(f"✗ Failed to update worksheet '{worksheet.title}': {str(e)}")
