@@ -146,22 +146,27 @@ class RBIDataFetcher:
             return None
     
     @staticmethod
-    def parse_excel_sheets(excel_file: str) -> Dict[str, pd.DataFrame]:
+    def parse_excel_sheets(excel_file: str, sheet_names_to_parse: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
         """
-        Parse all sheets from the Excel file
+        Parse sheets from the Excel file (optionally filtered by sheet names)
         
         Args:
             excel_file: Path to Excel file
+            sheet_names_to_parse: Optional list of sheet names to parse. If None, parse all.
             
         Returns:
             Dictionary mapping sheet names to DataFrames
         """
         try:
-            logger.info(f"Parsing all sheets from {excel_file}")
+            logger.info(f"Parsing sheets from {excel_file}")
             excel_file_read = pd.ExcelFile(excel_file)
             sheets_data = {}
             
-            for sheet_name in excel_file_read.sheet_names:
+            # If no specific sheets requested, use all
+            sheets_to_parse = sheet_names_to_parse if sheet_names_to_parse else excel_file_read.sheet_names
+            logger.info(f"Reading {len(sheets_to_parse)} sheets (out of {len(excel_file_read.sheet_names)} total)")
+            
+            for sheet_name in sheets_to_parse:
                 df = pd.read_excel(excel_file, sheet_name=sheet_name)
                 # Clean the dataframe immediately after loading
                 df = clean_dataframe(df)
@@ -543,28 +548,41 @@ class RBIDataFetcher:
             if not excel_file:
                 return False
             
-            # Step 2: Parse all sheets
-            sheets_data = self.parse_excel_sheets(excel_file)
+            # Step 2: Get sheet names and filter to current/future months BEFORE parsing
+            try:
+                excel_file_read = pd.ExcelFile(excel_file)
+                all_sheet_names = excel_file_read.sheet_names
+                logger.info(f"Found {len(all_sheet_names)} total sheets in Excel file")
+            except Exception as e:
+                logger.error(f"✗ Failed to read Excel sheet names: {str(e)}")
+                return False
+            
+            # Filter sheets: only current and future months
+            sheets_to_process = []
+            skipped_count = 0
+            for sheet_name in all_sheet_names:
+                if self._should_process_sheet(sheet_name):
+                    sheets_to_process.append(sheet_name)
+                else:
+                    skipped_count += 1
+                    logger.debug(f"⊘ Skipping past month sheet: '{sheet_name}'")
+            
+            logger.info(f"Processing {len(sheets_to_process)} sheets (skipped {skipped_count} past months)")
+            
+            if not sheets_to_process:
+                logger.warning("No sheets to process (all are past months)")
+                return True
+            
+            # Step 3: Parse only the filtered sheets
+            sheets_data = self.parse_excel_sheets(excel_file, sheet_names_to_parse=sheets_to_process)
             if not sheets_data:
                 return False
             
-            # Step 3: Filter to only current and future months (skip completed past months)
-            filtered_sheets = {}
-            skipped_count = 0
-            for sheet_name, df in sheets_data.items():
-                if self._should_process_sheet(sheet_name):
-                    filtered_sheets[sheet_name] = df
-                else:
-                    skipped_count += 1
-                    logger.info(f"⊘ Skipping past month sheet: '{sheet_name}'")
-            
-            logger.info(f"Processing {len(filtered_sheets)} sheets (skipped {skipped_count} past months)")
-            
             # Step 4: Update Google Sheet with new worksheets and data
             success_count = 0
-            total_sheets = len(filtered_sheets)
+            total_sheets = len(sheets_data)
             
-            for idx, (sheet_name, df) in enumerate(filtered_sheets.items(), 1):
+            for idx, (sheet_name, df) in enumerate(sheets_data.items(), 1):
                 logger.info(f"Processing sheet {idx}/{total_sheets}: '{sheet_name}'")
                 
                 # Sanitize sheet name for Google Sheets (max 100 chars, no special chars)
