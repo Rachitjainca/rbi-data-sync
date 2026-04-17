@@ -219,16 +219,24 @@ class RBIDataFetcher:
         Returns:
             Column name if found, None otherwise
         """
+        # First priority: exact keyword match
         for col in df.columns:
-            # Check if column name contains date-related keywords
-            if any(keyword in str(col).lower() for keyword in ['date', 'day', 'time', 'dt', 'period']):
+            col_lower = str(col).lower().strip()
+            if any(keyword in col_lower for keyword in ['date', 'day', 'time', 'dt', 'period']):
+                logger.info(f"Found date column: '{col}'")
                 return col
         
-        # If no date column found, use first column as identifier
-        if len(df.columns) > 0:
-            logger.warning(f"No explicit date column found; using first column as identifier")
+        # Second priority: if only one column, use it
+        if len(df.columns) == 1:
+            logger.warning(f"No explicit date column found; using single column '{df.columns[0]}' as identifier")
             return df.columns[0]
         
+        # Third priority: first column as fallback
+        if len(df.columns) > 0:
+            logger.warning(f"No explicit date column found; using first column '{df.columns[0]}' as identifier")
+            return df.columns[0]
+        
+        logger.error("No columns found in DataFrame")
         return None
     
     @staticmethod
@@ -318,8 +326,8 @@ class RBIDataFetcher:
     
     def update_gsheet_data(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> bool:
         """
-        Update Google Sheet worksheet with data from DataFrame (INCREMENTAL - new dates only)
-        Only appends rows with dates not already in the worksheet
+        Update Google Sheet worksheet with data from DataFrame (INCREMENTAL - new rows only)
+        Only appends rows not already in the worksheet
         
         Args:
             worksheet: gspread Worksheet object
@@ -337,11 +345,14 @@ class RBIDataFetcher:
             time.sleep(RATE_LIMIT_DELAY)
             
             date_col = self.find_date_column(df)
+            logger.info(f"Using date column for deduplication: '{date_col}'")
             
             # Get existing data from worksheet
             def get_all_values():
                 return worksheet.get_all_values()
             existing_data = retry_with_backoff(get_all_values)
+            
+            logger.info(f"Worksheet '{worksheet.title}' contains {len(existing_data)} total rows (including header)")
             
             if not existing_data:
                 # Worksheet is empty, write header and all data
@@ -354,11 +365,63 @@ class RBIDataFetcher:
             header = existing_data[0]
             existing_rows = existing_data[1:] if len(existing_data) > 1 else []
             
-            # Check if DataFrame columns match existing header
-            df_cols = [str(col) for col in df.columns]
-            if df_cols != header:
-                logger.warning(f"Column mismatch in '{worksheet.title}'; schema changed - rebuilding")
+            logger.debug(f"Header row: {header[:5]}...")  # Log first 5 columns of header
+            logger.info(f"Existing data has header + {len(existing_rows)} data rows")
+            
+            # Filter out rows that appear to be metadata or empty
+            # Skip rows where first column is just text like "Sheet April 2026" or similar
+            filtered_existing_rows = []
+            skipped_metadata = 0
+            skipped_empty = 0
+            
+            for row in existing_rows:
+                if not row or all(not str(cell).strip() for cell in row):
+                    # Skip completely empty rows
+                    skipped_empty += 1
+                    logger.debug(f"Skipping empty row")
+                    continue
+                
+                # Check if first cell looks like metadata (contains "Sheet" or similar)
+                first_cell_value = str(row[0]).strip().lower() if row else ""
+                if any(keyword in first_cell_value for keyword in ['sheet', 'metadata', 'total', 'summary']):
+                    skipped_metadata += 1
+                    logger.debug(f"Skipping potential metadata row: {row[0]}")
+                    continue
+                
+                filtered_existing_rows.append(row)
+            
+            existing_rows = filtered_existing_rows
+            logger.info(f"After filtering: {len(existing_rows)} actual data rows (skipped {skipped_empty} empty + {skipped_metadata} metadata)")
+            
+            if not existing_rows:
+                logger.warning(f"⚠ No valid data rows found after filtering (worksheet might only have header!)")
+            
+            if existing_rows and len(existing_rows) > 0:
+                logger.debug(f"First existing data row (first 5 cells): {existing_rows[0][:5]}")
+                logger.debug(f"Last existing data row (first 5 cells): {existing_rows[-1][:5]}")
+            
+            # Check if DataFrame columns match existing header (more lenient comparison)
+            df_cols = [str(col).strip() for col in df.columns]
+            header_normalized = [str(h).strip() for h in header]
+            
+            # Check for actual schema mismatch (not just whitespace/dtype differences)
+            schema_mismatch = False
+            
+            if len(df_cols) != len(header_normalized):
+                schema_mismatch = True
+                logger.warning(f"Column count mismatch: DataFrame has {len(df_cols)} columns, worksheet has {len(header_normalized)}")
+            elif df_cols != header_normalized:
+                # Check if it's just a whitespace or format issue
+                if any(col.lower() != hdr.lower() for col, hdr in zip(df_cols, header_normalized)):
+                    schema_mismatch = True
+                    logger.warning(f"Column names mismatch")
+            
+            if schema_mismatch:
+                logger.warning(f"Column mismatch in '{worksheet.title}'")
+                logger.warning(f"  DataFrame columns ({len(df_cols)}): {df_cols[:5]}...")
+                logger.warning(f"  Worksheet columns ({len(header_normalized)}): {header_normalized[:5]}...")
                 # Column structure changed - need to rebuild
+                logger.info(f"Rebuilding worksheet '{worksheet.title}' with new schema")
                 def clear_ws():
                     worksheet.clear()
                 retry_with_backoff(clear_ws)
@@ -366,11 +429,26 @@ class RBIDataFetcher:
                 logger.info(f"✓ Rebuilt worksheet '{worksheet.title}' with new schema")
                 return True
             
-            # Incremental update: only add rows with new dates
-            new_rows_df = self._filter_new_rows(df, existing_rows, header, date_col)
+            logger.info(f"Column structure matches; proceeding with incremental update")
+            
+            # CRITICAL: Reorder DataFrame columns to match worksheet column order
+            # This ensures row-hash comparison works even if columns are in different order
+            try:
+                df_reordered = df[[col.strip() for col in header_normalized]].copy()
+                logger.debug(f"DataFrame reordered to match worksheet column order")
+            except KeyError as e:
+                logger.error(f"Failed to reorder DataFrame columns to match header: {e}")
+                logger.warning(f"DataFrame columns: {list(df.columns)}")
+                logger.warning(f"Header columns: {header_normalized[:5]}...")
+                # If reordering fails, use original DataFrame
+                df_reordered = df.copy()
+                logger.info(f"Proceeding with original column order")
+            
+            # Incremental update: only add rows not already in the worksheet
+            new_rows_df = self._filter_new_rows(df_reordered, existing_rows, header, date_col)
             
             if new_rows_df.empty:
-                logger.info(f"No new dates found for worksheet '{worksheet.title}'; skipping")
+                logger.info(f"No new rows found for worksheet '{worksheet.title}'; skipping update")
                 return True
             
             logger.info(f"Found {len(new_rows_df)} new rows to append for worksheet '{worksheet.title}'")
@@ -382,6 +460,8 @@ class RBIDataFetcher:
             return True
         except Exception as e:
             logger.error(f"✗ Failed to update worksheet '{worksheet.title}': {str(e)}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return False
     
     def _write_to_worksheet_incremental(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> None:
@@ -421,41 +501,129 @@ class RBIDataFetcher:
             logger.error(f"Error initializing worksheet: {str(e)}")
             raise
     
-    def _filter_new_rows(self, df: pd.DataFrame, existing_rows: List, header: List, date_col: str) -> pd.DataFrame:
+    @staticmethod
+    def _normalize_date_string(date_val: str) -> str:
         """
-        Filter DataFrame to only include rows with dates NOT already in the worksheet
+        Normalize a date string to a consistent format for comparison
+        Handles formats like "2026-04-01 0:00", "2026-04-01 00:00:00", etc.
         
         Args:
-            df: New DataFrame to filter
-            existing_rows: Existing rows from worksheet
-            header: Worksheet header
-            date_col: Date column name
+            date_val: Date string to normalize
             
         Returns:
-            Filtered DataFrame with only new dates
+            Normalized date string (YYYY-MM-DD format)
         """
-        if not existing_rows or date_col not in header or date_col not in df.columns:
-            # If no existing rows or can't determine date column, return all rows
+        try:
+            # Remove extra whitespace
+            date_val = str(date_val).strip()
+            
+            # Try to parse as datetime first
+            try:
+                # Try parsing with pandas (handles multiple formats)
+                parsed_date = pd.to_datetime(date_val)
+                # Return in normalized format: YYYY-MM-DD (just date, no time)
+                return parsed_date.strftime('%Y-%m-%d')
+            except:
+                # If parsing fails, try to extract just the date part
+                # Match pattern like "2026-04-01" at the start
+                import re
+                date_match = re.search(r'(\d{4}-\d{2}-\d{2})', date_val)
+                if date_match:
+                    return date_match.group(1)
+                
+                # If that fails too, return normalized string
+                return date_val
+        except Exception as e:
+            logger.debug(f"Error normalizing date '{date_val}': {e}; returning as-is")
+            return str(date_val).strip()
+    
+    @staticmethod
+    def _get_row_hash(row: List) -> str:
+        """
+        Create a hash of a row for deduplication (more robust than date-only)
+        
+        Args:
+            row: Row data as list
+            
+        Returns:
+            Hash string of the row
+        """
+        import hashlib
+        # Convert row to string and hash it
+        row_str = '|'.join(str(cell).strip() for cell in row)
+        return hashlib.md5(row_str.encode()).hexdigest()
+    
+    def _filter_new_rows(self, df: pd.DataFrame, existing_rows: List, header: List, date_col: str) -> pd.DataFrame:
+        """
+        Filter DataFrame to only include rows NOT already in the worksheet
+        Uses first column as unique identifier (most stable approach)
+        
+        Args:
+            df: New DataFrame (columns already reordered to match header)
+            existing_rows: Existing rows from worksheet (filtered for metadata)
+            header: Worksheet header
+            date_col: Date column name (unused - keeping for compatibility)
+            
+        Returns:
+            Filtered DataFrame with only new rows
+        """
+        if not existing_rows:
+            logger.info("No existing rows in worksheet; all rows are new")
             return df
         
         try:
-            # Get existing dates
-            date_col_idx = header.index(date_col)
-            existing_dates = set()
+            # Use FIRST column as unique key (most reliable - doesn't depend on date formatting)
+            first_col_name = df.columns[0] if len(df.columns) > 0 else None
+            
+            if not first_col_name:
+                logger.warning("DataFrame has no columns; returning all rows")
+                return df
+            
+            logger.info(f"Using '{first_col_name}' (first column) as unique identifier for deduplication")
+            
+            # Extract first column values from existing worksheet rows
+            existing_first_col_values = set()
+            sample_existing = []
+            
             for row in existing_rows:
-                if len(row) > date_col_idx and row[date_col_idx]:
-                    existing_dates.add(str(row[date_col_idx]).strip())
+                if row and len(row) > 0:
+                    first_cell = str(row[0]).strip()
+                    if first_cell:
+                        existing_first_col_values.add(first_cell)
+                        if len(sample_existing) < 5:
+                            sample_existing.append(first_cell)
             
-            logger.info(f"Found {len(existing_dates)} existing dates in worksheet")
+            logger.info(f"✓ Found {len(existing_first_col_values)} unique values in first column of worksheet")
+            logger.info(f"Sample existing first-column values: {sample_existing}")
             
-            # Filter to only new dates
-            new_rows_mask = ~df[date_col].astype(str).isin(existing_dates)
-            new_df = df[new_rows_mask].copy()
+            # Extract first column values from DataFrame
+            df_first_col = df[first_col_name].astype(str).str.strip()
+            sample_df = df_first_col.head(5).tolist()
+            logger.info(f"Sample DataFrame first-column values: {sample_df}")
             
-            logger.info(f"Filtered to {len(new_df)} new rows with dates not in worksheet")
-            return new_df
+            # Compare - mark rows as new if first column value not in existing set
+            new_rows_mask = ~df_first_col.isin(existing_first_col_values)
+            new_count = new_rows_mask.sum()
+            duplicate_count = len(df) - new_count
+            
+            logger.info(f"Comparison result: {new_count} new rows, {duplicate_count} duplicates out of {len(df)} total")
+            
+            # Safety check
+            if new_count == len(df) and len(existing_first_col_values) > 0:
+                logger.warning(f"⚠ All {len(df)} rows marked as NEW despite {len(existing_first_col_values)} existing identifiers!")
+                logger.warning(f"Possible mismatch between DataFrame and worksheet first column")
+                logger.warning(f"Sample existing: {sorted(list(existing_first_col_values))[:3]}")
+                logger.warning(f"Sample DataFrame: {df_first_col.head(3).tolist()}")
+            elif new_count == 0 and len(existing_first_col_values) > 0:
+                logger.info(f"✓ All {len(df)} rows already exist in worksheet (no new data to add)")
+            
+            return df[new_rows_mask].copy()
+            
         except Exception as e:
-            logger.warning(f"Error filtering new rows: {str(e)}; returning all rows")
+            logger.error(f"Error filtering new rows: {str(e)}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            logger.warning(f"Filtering failed - RETURNING ALL ROWS AS SAFETY FALLBACK")
             return df
     
     def _append_new_rows(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> None:
@@ -473,6 +641,8 @@ class RBIDataFetcher:
             # Add rate-limiting delay before append
             time.sleep(RATE_LIMIT_DELAY)
             
+            logger.info(f"About to append {len(data_rows)} rows; sample row 1: {data_rows[0][:5] if data_rows else 'N/A'}...")
+            
             # Batch write for performance
             batch_size = 100
             if data_rows:
@@ -489,6 +659,23 @@ class RBIDataFetcher:
                         time.sleep(RATE_LIMIT_DELAY * 2)
                         
                     logger.info(f"Appended batch {i//batch_size + 1} ({len(batch)} rows)")
+            
+            # DIAGNOSTIC: Get fresh data from worksheet to confirm what was written
+            logger.info(f"Retrieving worksheet data to verify what was written...")
+            time.sleep(1)  # Wait a moment for Google Sheets to update
+            
+            def get_all_values():
+                return worksheet.get_all_values()
+            
+            fresh_data = retry_with_backoff(get_all_values)
+            num_rows_after = len(fresh_data) - 1 if fresh_data else 0  # Exclude header
+            logger.info(f"Worksheet now has {num_rows_after} data rows after append")
+            
+            if fresh_data and len(fresh_data) > 1:
+                logger.debug(f"Sample of just-written data:")
+                logger.debug(f"  Row from DataFrame: {data_rows[0][:5] if data_rows else 'N/A'}")
+                logger.debug(f"  Row from worksheet: {fresh_data[-1][:5] if len(fresh_data) > 1 else 'N/A'}")
+                
         except Exception as e:
             logger.error(f"Error appending new rows: {str(e)}")
             raise
