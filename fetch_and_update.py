@@ -227,8 +227,8 @@ class RBIDataFetcher:
     
     def update_gsheet_data(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> bool:
         """
-        Update Google Sheet worksheet with data from DataFrame
-        Performs upsert based on date identifier (update if exists, insert if new)
+        Update Google Sheet worksheet with data from DataFrame (INCREMENTAL - new dates only)
+        Only appends rows with dates not already in the worksheet
         
         Args:
             worksheet: gspread Worksheet object
@@ -255,7 +255,8 @@ class RBIDataFetcher:
             if not existing_data:
                 # Worksheet is empty, write header and all data
                 logger.info(f"Worksheet '{worksheet.title}' is empty; writing header and {len(df)} rows")
-                self._write_to_worksheet(worksheet, df)
+                self._write_to_worksheet_incremental(worksheet, df)
+                logger.info(f"✓ Successfully initialized worksheet '{worksheet.title}' with {len(df)} rows")
                 return True
             
             # Extract header and existing rows
@@ -265,29 +266,141 @@ class RBIDataFetcher:
             # Check if DataFrame columns match existing header
             df_cols = [str(col) for col in df.columns]
             if df_cols != header:
-                logger.warning(f"Column mismatch in '{worksheet.title}'; updating header")
-                # Clear and rewrite with new data
+                logger.warning(f"Column mismatch in '{worksheet.title}'; schema changed - rebuilding")
+                # Column structure changed - need to rebuild
                 def clear_ws():
                     worksheet.clear()
                 retry_with_backoff(clear_ws)
-                self._write_to_worksheet(worksheet, df)
+                self._write_to_worksheet_incremental(worksheet, df)
+                logger.info(f"✓ Rebuilt worksheet '{worksheet.title}' with new schema")
                 return True
             
-            # Perform upsert based on date identifier
-            logger.info(f"Performing upsert for worksheet '{worksheet.title}' on column '{date_col}'")
-            updated_rows = self._upsert_rows(df, existing_rows, header, date_col)
+            # Incremental update: only add rows with new dates
+            new_rows_df = self._filter_new_rows(df, existing_rows, header, date_col)
             
-            # Clear and write all data back
-            def clear_ws():
-                worksheet.clear()
-            retry_with_backoff(clear_ws)
-            self._write_to_worksheet(worksheet, df, existing_rows=updated_rows)
+            if new_rows_df.empty:
+                logger.info(f"No new dates found for worksheet '{worksheet.title}'; skipping")
+                return True
             
-            logger.info(f"✓ Successfully updated worksheet '{worksheet.title}'")
+            logger.info(f"Found {len(new_rows_df)} new rows to append for worksheet '{worksheet.title}'")
+            
+            # Append only new rows (don't touch existing data)
+            self._append_new_rows(worksheet, new_rows_df)
+            
+            logger.info(f"✓ Successfully added {len(new_rows_df)} new rows to worksheet '{worksheet.title}'")
             return True
         except Exception as e:
             logger.error(f"✗ Failed to update worksheet '{worksheet.title}': {str(e)}")
             return False
+    
+    def _write_to_worksheet_incremental(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> None:
+        """Helper function to write data to worksheet (initial write with header) with rate limiting"""
+        try:
+            # Prepare header
+            header = [str(col) for col in df.columns]
+            
+            # Add rate-limiting delay before append
+            time.sleep(RATE_LIMIT_DELAY)
+            
+            def append_header():
+                worksheet.append_row(header)
+            retry_with_backoff(append_header)
+            
+            # Prepare data rows
+            data_rows = df.values.tolist()
+            
+            # Add rate-limiting delay before batch append
+            time.sleep(RATE_LIMIT_DELAY)
+            
+            # Batch write for performance (limit rows per batch to avoid quota)
+            batch_size = 100
+            if data_rows:
+                for i in range(0, len(data_rows), batch_size):
+                    batch = data_rows[i:i+batch_size]
+                    
+                    def append_batch():
+                        worksheet.append_rows(batch, value_input_option='USER_ENTERED')
+                    
+                    retry_with_backoff(append_batch)
+                    
+                    # Rate limiting between batches
+                    if i + batch_size < len(data_rows):
+                        time.sleep(RATE_LIMIT_DELAY * 2)
+        except Exception as e:
+            logger.error(f"Error initializing worksheet: {str(e)}")
+            raise
+    
+    def _filter_new_rows(self, df: pd.DataFrame, existing_rows: List, header: List, date_col: str) -> pd.DataFrame:
+        """
+        Filter DataFrame to only include rows with dates NOT already in the worksheet
+        
+        Args:
+            df: New DataFrame to filter
+            existing_rows: Existing rows from worksheet
+            header: Worksheet header
+            date_col: Date column name
+            
+        Returns:
+            Filtered DataFrame with only new dates
+        """
+        if not existing_rows or date_col not in header or date_col not in df.columns:
+            # If no existing rows or can't determine date column, return all rows
+            return df
+        
+        try:
+            # Get existing dates
+            date_col_idx = header.index(date_col)
+            existing_dates = set()
+            for row in existing_rows:
+                if len(row) > date_col_idx and row[date_col_idx]:
+                    existing_dates.add(str(row[date_col_idx]).strip())
+            
+            logger.info(f"Found {len(existing_dates)} existing dates in worksheet")
+            
+            # Filter to only new dates
+            new_rows_mask = ~df[date_col].astype(str).isin(existing_dates)
+            new_df = df[new_rows_mask].copy()
+            
+            logger.info(f"Filtered to {len(new_df)} new rows with dates not in worksheet")
+            return new_df
+        except Exception as e:
+            logger.warning(f"Error filtering new rows: {str(e)}; returning all rows")
+            return df
+    
+    def _append_new_rows(self, worksheet: gspread.Worksheet, df: pd.DataFrame) -> None:
+        """
+        Append new rows to worksheet (only data rows, no header)
+        
+        Args:
+            worksheet: gspread Worksheet object
+            df: DataFrame with new rows to append
+        """
+        try:
+            # Prepare data rows
+            data_rows = df.values.tolist()
+            
+            # Add rate-limiting delay before append
+            time.sleep(RATE_LIMIT_DELAY)
+            
+            # Batch write for performance
+            batch_size = 100
+            if data_rows:
+                for i in range(0, len(data_rows), batch_size):
+                    batch = data_rows[i:i+batch_size]
+                    
+                    def append_batch():
+                        worksheet.append_rows(batch, value_input_option='USER_ENTERED')
+                    
+                    retry_with_backoff(append_batch)
+                    
+                    # Rate limiting between batches
+                    if i + batch_size < len(data_rows):
+                        time.sleep(RATE_LIMIT_DELAY * 2)
+                        
+                    logger.info(f"Appended batch {i//batch_size + 1} ({len(batch)} rows)")
+        except Exception as e:
+            logger.error(f"Error appending new rows: {str(e)}")
+            raise
     
     def _write_to_worksheet(self, worksheet: gspread.Worksheet, df: pd.DataFrame, existing_rows: List = None) -> None:
         """Helper function to write data to worksheet with rate limiting"""
@@ -325,34 +438,6 @@ class RBIDataFetcher:
         except Exception as e:
             logger.error(f"Error writing to worksheet: {str(e)}")
             raise
-    
-    @staticmethod
-    def _upsert_rows(df: pd.DataFrame, existing_rows: List, header: List, date_col: str) -> List:
-        """
-        Perform upsert: merge new data with existing rows based on date identifier
-        
-        Returns:
-            List of updated rows
-        """
-        if not existing_rows or date_col not in header:
-            return df.values.tolist()
-        
-        try:
-            date_col_idx = header.index(date_col)
-            existing_dict = {row[date_col_idx]: row for row in existing_rows if len(row) > date_col_idx}
-            
-            # Update with new data
-            for idx, row in enumerate(df.values.tolist()):
-                date_val = str(row[df.columns.tolist().index(date_col)]) if date_col in df.columns else None
-                if date_val in existing_dict:
-                    existing_dict[date_val] = row
-                else:
-                    existing_dict[date_val] = row
-            
-            return list(existing_dict.values())
-        except Exception as e:
-            logger.warning(f"Upsert failed: {str(e)}; returning new data only")
-            return df.values.tolist()
     
     def sync_data(self) -> bool:
         """
