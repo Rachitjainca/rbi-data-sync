@@ -6,13 +6,15 @@ Fetches RBI Excel file hourly and updates a single Google Sheet with new workshe
 import os
 import json
 import logging
+import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import requests
 import pandas as pd
+import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import WorksheetNotFound, APIError
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +30,63 @@ logger = logging.getLogger(__name__)
 # Constants
 RBI_EXCEL_URL = "https://rbidocs.rbi.org.in/rdocs/content/docs/PSDDP04062020.xlsx"
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+API_RETRY_DELAY = 2  # seconds between API calls
+API_MAX_RETRIES = 3  # max retry attempts on rate limit
+RATE_LIMIT_DELAY = 0.5  # delay between write operations to avoid quota hits
+
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean DataFrame by replacing NaN, infinity, and other problematic values
+    
+    Args:
+        df: DataFrame to clean
+        
+    Returns:
+        Cleaned DataFrame
+    """
+    try:
+        # Replace NaN with empty string
+        df = df.fillna('')
+        
+        # Replace infinity with empty string
+        df = df.replace([np.inf, -np.inf], '')
+        
+        # Convert problematic dtypes
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                # Handle remaining NaN strings
+                df[col] = df[col].astype(str).replace('nan', '').replace('inf', '').replace('-inf', '')
+        
+        return df
+    except Exception as e:
+        logger.warning(f"Error cleaning dataframe: {str(e)}; returning as-is")
+        return df
+
+
+def retry_with_backoff(func, max_retries=API_MAX_RETRIES, delay=API_RETRY_DELAY):
+    """
+    Retry a function with exponential backoff on API quota errors
+    
+    Args:
+        func: Function to call
+        max_retries: Maximum retry attempts
+        delay: Initial delay between retries
+        
+    Returns:
+        Function result
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except APIError as e:
+            if '429' in str(e) and attempt < max_retries - 1:
+                wait_time = delay * (2 ** attempt)
+                logger.warning(f"Rate limit hit; retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+
 
 class RBIDataFetcher:
     def __init__(self, service_account_json: str, spreadsheet_id: str):
@@ -103,6 +162,8 @@ class RBIDataFetcher:
             
             for sheet_name in excel_file_read.sheet_names:
                 df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                # Clean the dataframe immediately after loading
+                df = clean_dataframe(df)
                 sheets_data[sheet_name] = df
                 logger.info(f"  ✓ Parsed sheet '{sheet_name}': {len(df)} rows, {len(df.columns)} columns")
             
@@ -125,13 +186,17 @@ class RBIDataFetcher:
         try:
             # Try to get existing worksheet
             try:
-                worksheet = self.spreadsheet.worksheet(sheet_name)
+                def get_ws():
+                    return self.spreadsheet.worksheet(sheet_name)
+                worksheet = retry_with_backoff(get_ws)
                 logger.info(f"✓ Found existing worksheet: '{sheet_name}'")
                 return worksheet
             except WorksheetNotFound:
                 # Worksheet doesn't exist, create new one
                 logger.info(f"Creating new worksheet: '{sheet_name}'")
-                worksheet = self.spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=26)
+                def create_ws():
+                    return self.spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=50)
+                worksheet = retry_with_backoff(create_ws)
                 logger.info(f"✓ Successfully created new worksheet: '{sheet_name}'")
                 return worksheet
         except Exception as e:
@@ -167,7 +232,7 @@ class RBIDataFetcher:
         
         Args:
             worksheet: gspread Worksheet object
-            df: DataFrame with new data
+            df: DataFrame with new data (already cleaned)
             
         Returns:
             True if successful, False otherwise
@@ -177,10 +242,15 @@ class RBIDataFetcher:
                 logger.warning(f"DataFrame is empty; skipping update for worksheet '{worksheet.title}'")
                 return True
             
+            # Add rate-limiting delay before each write
+            time.sleep(RATE_LIMIT_DELAY)
+            
             date_col = self.find_date_column(df)
             
             # Get existing data from worksheet
-            existing_data = worksheet.get_all_values()
+            def get_all_values():
+                return worksheet.get_all_values()
+            existing_data = retry_with_backoff(get_all_values)
             
             if not existing_data:
                 # Worksheet is empty, write header and all data
@@ -195,9 +265,11 @@ class RBIDataFetcher:
             # Check if DataFrame columns match existing header
             df_cols = [str(col) for col in df.columns]
             if df_cols != header:
-                logger.warning(f"Column mismatch in'{worksheet.title}'; updating header")
+                logger.warning(f"Column mismatch in '{worksheet.title}'; updating header")
                 # Clear and rewrite with new data
-                worksheet.clear()
+                def clear_ws():
+                    worksheet.clear()
+                retry_with_backoff(clear_ws)
                 self._write_to_worksheet(worksheet, df)
                 return True
             
@@ -206,7 +278,9 @@ class RBIDataFetcher:
             updated_rows = self._upsert_rows(df, existing_rows, header, date_col)
             
             # Clear and write all data back
-            worksheet.clear()
+            def clear_ws():
+                worksheet.clear()
+            retry_with_backoff(clear_ws)
             self._write_to_worksheet(worksheet, df, existing_rows=updated_rows)
             
             logger.info(f"✓ Successfully updated worksheet '{worksheet.title}'")
@@ -215,19 +289,42 @@ class RBIDataFetcher:
             logger.error(f"✗ Failed to update worksheet '{worksheet.title}': {str(e)}")
             return False
     
-    @staticmethod
-    def _write_to_worksheet(worksheet: gspread.Worksheet, df: pd.DataFrame, existing_rows: List = None) -> None:
-        """Helper function to write data to worksheet"""
-        # Prepare header
-        header = [str(col) for col in df.columns]
-        worksheet.append_row(header)
-        
-        # Prepare data rows
-        data_rows = df.values.tolist()
-        
-        # Batch write for performance
-        if data_rows:
-            worksheet.append_rows(data_rows, value_input_option='USER_ENTERED')
+    def _write_to_worksheet(self, worksheet: gspread.Worksheet, df: pd.DataFrame, existing_rows: List = None) -> None:
+        """Helper function to write data to worksheet with rate limiting"""
+        try:
+            # Prepare header
+            header = [str(col) for col in df.columns]
+            
+            # Add rate-limiting delay before append
+            time.sleep(RATE_LIMIT_DELAY)
+            
+            def append_header():
+                worksheet.append_row(header)
+            retry_with_backoff(append_header)
+            
+            # Prepare data rows
+            data_rows = df.values.tolist()
+            
+            # Add rate-limiting delay before batch append
+            time.sleep(RATE_LIMIT_DELAY)
+            
+            # Batch write for performance (limit rows per batch to avoid quota)
+            batch_size = 100
+            if data_rows:
+                for i in range(0, len(data_rows), batch_size):
+                    batch = data_rows[i:i+batch_size]
+                    
+                    def append_batch():
+                        worksheet.append_rows(batch, value_input_option='USER_ENTERED')
+                    
+                    retry_with_backoff(append_batch)
+                    
+                    # Rate limiting between batches
+                    if i + batch_size < len(data_rows):
+                        time.sleep(RATE_LIMIT_DELAY * 2)
+        except Exception as e:
+            logger.error(f"Error writing to worksheet: {str(e)}")
+            raise
     
     @staticmethod
     def _upsert_rows(df: pd.DataFrame, existing_rows: List, header: List, date_col: str) -> List:
@@ -281,15 +378,22 @@ class RBIDataFetcher:
             
             # Step 3: Update Google Sheet with new worksheets and data
             success_count = 0
-            for sheet_name, df in sheets_data.items():
+            total_sheets = len(sheets_data)
+            
+            for idx, (sheet_name, df) in enumerate(sheets_data.items(), 1):
+                logger.info(f"Processing sheet {idx}/{total_sheets}: '{sheet_name}'")
+                
                 # Sanitize sheet name for Google Sheets (max 100 chars, no special chars)
                 gsheet_name = self._sanitize_sheet_name(sheet_name)
                 
                 worksheet = self.check_and_create_worksheet(gsheet_name)
                 if worksheet and self.update_gsheet_data(worksheet, df):
                     success_count += 1
+                
+                # Rate limit between sheets
+                time.sleep(RATE_LIMIT_DELAY)
             
-            logger.info(f"✓ Successfully updated {success_count}/{len(sheets_data)} worksheets")
+            logger.info(f"✓ Successfully updated {success_count}/{total_sheets} worksheets")
             
             # Cleanup: Remove downloaded file
             try:
